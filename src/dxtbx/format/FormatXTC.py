@@ -9,6 +9,8 @@ from itertools import groupby
 import numpy as np
 from scipy.optimize import curve_fit
 from scipy.signal import convolve, savgol_filter
+from scipy import constants
+EV_CONV = 1e10 * constants.h * constants.c / constants.eV # Conversion from eV to Angstrom
 
 import serialtbx.detector.xtc
 import serialtbx.util
@@ -112,6 +114,10 @@ locator_str = """
   spectrum_gaussian_fit = False
     .type = bool
     .help = True: Fit a Gaussian to the spectrum. False: Weighted average.
+  spectrum_gaussian_algorithm = light *original
+    .type = choice
+    .help = Original, use savgol filter, then default to max height on bad fit
+    .help = Light, no savgol, default to mean fit on Exception
   spectrum_gaussian_max_fwhm = 20
     .type = float
     .help = reject spectra with a fitted Gaussian FWHM above this value.
@@ -649,6 +655,12 @@ class FormatXTC(FormatMultiImage, FormatStill, Format):
         frac_width = width / spectrum.get_weighted_energy_eV()
         return frac_width < self.params.check_spectrum.max_width
 
+    @staticmethod
+    def gaussian_offset(x, amplitude, center, sigma, offset):
+                        return offset + amplitude * np.exp(
+                            -((x - center) ** 2) / (2 * sigma**2)
+                        )
+
     def _beam(self, index=None):
         """Returns a simple model for the beam"""
         if index is None:
@@ -666,13 +678,7 @@ class FormatXTC(FormatMultiImage, FormatStill, Format):
                         return None
                 if not self.params.spectrum_gaussian_fit:
                     wavelength = spectrum.get_weighted_wavelength()
-                else:
-
-                    def gaussian_offset(x, amplitude, center, sigma, offset):
-                        return offset + amplitude * np.exp(
-                            -((x - center) ** 2) / (2 * sigma**2)
-                        )
-
+                elif self.params.spectrum_gaussian_algorithm == "original":
                     e = spectrum.get_energies_eV().as_numpy_array()
                     w = spectrum.get_weights().as_numpy_array()
                     # Smooth before choosing the max pixel. This gives us some resistance to
@@ -706,6 +712,26 @@ class FormatXTC(FormatMultiImage, FormatStill, Format):
                         wavelength = None
                     else:
                         wavelength = 12398.4 / center
+                elif self.params.spectrum_gaussian_algorithm == "light":
+                    wavelength_provisional = spectrum.get_weighted_wavelength()
+                    energies_ = spectrum.get_energies_eV().as_numpy_array()
+                    weights_ = spectrum.get_weights().as_numpy_array()
+                    center_init = EV_CONV / wavelength_provisional
+                    max_idx = np.argmax(weights_)
+                    amplitude_init = weights_[max_idx]
+                    sigma_init = 10  # Guess bandwidth in eV
+                    offset_init = 0
+                    p0 = [amplitude_init, center_init, sigma_init, offset_init]
+                    b_low = (0, 0, 0, -np.inf)
+                    b_high = (np.inf, np.inf, np.inf, np.inf)
+                    try:
+                      popt, pcov = curve_fit(
+                            self.gaussian_offset, energies_, weights_, p0=p0, bounds=(b_low, b_high)
+                        )
+                      amplitude, center, sigma, offset = popt
+                      wavelength = EV_CONV / center
+                    except RuntimeError:  # Refinement failed
+                      wavelength = wavelength_provisional
 
             else:
                 try:
